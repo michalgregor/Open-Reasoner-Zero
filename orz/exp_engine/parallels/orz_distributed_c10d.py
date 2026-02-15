@@ -26,7 +26,6 @@ from torch.distributed.distributed_c10d import (
     ProcessGroup,
     Store,
     _new_process_group_helper,
-    _shutdown_backend,
     _unregister_all_process_groups,
     _unregister_process_group,
     _update_default_pg,
@@ -35,6 +34,19 @@ from torch.distributed.distributed_c10d import (
     rendezvous,
 )
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+try:
+    # `_shutdown_backend` is a private API that was removed in torch>=2.7.
+    from torch.distributed.distributed_c10d import _shutdown_backend
+except ImportError:
+    _shutdown_backend = None
+
+
+def _orz_shutdown_backend(pg: ProcessGroup):
+    if _shutdown_backend is not None:
+        _shutdown_backend(pg)
+    else:
+        pg.shutdown()
 
 
 def get_free_port():
@@ -140,7 +152,7 @@ def orz_destroy_process_group(group: Optional[ProcessGroup] = None):
         # order because ncclCommAbort() was a 'collective' call in some
         # versions of NCCL.
         for pg_to_shutdown in sorted(_world.pg_names, key=lambda x: _world.pg_names[x], reverse=True):
-            _shutdown_backend(pg_to_shutdown)
+            _orz_shutdown_backend(pg_to_shutdown)
 
         _update_default_pg(None)
         _world.pg_map.clear()
@@ -163,7 +175,7 @@ def orz_destroy_process_group(group: Optional[ProcessGroup] = None):
         # process group is in good state, we aren't dealing with failures.
         _world.group_count = 0
     else:
-        _shutdown_backend(pg)
+        _orz_shutdown_backend(pg)
         del _world.pg_map[pg]
         del _world.pg_names[pg]
         del _world.pg_group_ranks[pg]
