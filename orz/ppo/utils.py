@@ -374,6 +374,7 @@ def create_vllm_engines(
     gpu_memory_utilization: float = 0.85,
     max_num_seqs: int = 256,
     colocate_pg: Optional[PlacementGroup] = None,
+    attention_backend: Optional[str] = None,
 ):
     vllm_engines = []
     if tensor_parallel_size > 1:
@@ -387,21 +388,26 @@ def create_vllm_engines(
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg, placement_group_capture_child_tasks=True, placement_group_bundle_index=0
             )
+            remote_kwargs = dict(
+                trust_remote_code=True,
+                tensor_parallel_size=tensor_parallel_size,
+                dtype="bfloat16",
+                seed=seed + i,
+                enable_prefix_caching=enable_prefix_caching,
+                enforce_eager=enforce_eager,
+                max_model_len=max_model_len,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_batched_tokens=max_num_batched_tokens if enable_chunked_prefill else None,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_num_seqs=max_num_seqs,
+                block_size=256,
+                enable_sleep_mode=colocate_with_actor,
+            )
+            if attention_backend:
+                remote_kwargs["attention_backend"] = attention_backend
             vllm_engines.append(
                 LLMRayActor.options(num_cpus=1, num_gpus=num_gpus, scheduling_strategy=scheduling_strategy,).remote(
-                    pretrain,
-                    trust_remote_code=True,
-                    tensor_parallel_size=tensor_parallel_size,
-                    dtype="bfloat16",
-                    seed=seed + i,
-                    enable_prefix_caching=enable_prefix_caching,
-                    enforce_eager=enforce_eager,
-                    max_model_len=max_model_len,
-                    enable_chunked_prefill=enable_chunked_prefill,
-                    max_num_batched_tokens=max_num_batched_tokens if enable_chunked_prefill else None,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_num_seqs=max_num_seqs,
-                    block_size=256,
+                    pretrain, **remote_kwargs
                 )
             )
     else:
@@ -422,26 +428,29 @@ def create_vllm_engines(
                 placement_group_capture_child_tasks=True,
                 placement_group_bundle_index=i,
             )
+            remote_kwargs = dict(
+                trust_remote_code=True,
+                tensor_parallel_size=tensor_parallel_size,
+                dtype="bfloat16",
+                seed=seed + i,
+                enable_prefix_caching=enable_prefix_caching,
+                enforce_eager=enforce_eager,
+                max_model_len=max_model_len,
+                enable_chunked_prefill=enable_chunked_prefill,
+                max_num_batched_tokens=max_num_batched_tokens if enable_chunked_prefill else None,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_num_seqs=max_num_seqs,
+                block_size=256,
+                enable_sleep_mode=colocate_with_actor,
+            )
+            if attention_backend:
+                remote_kwargs["attention_backend"] = attention_backend
             vllm_engines.append(
                 LLMRayActor.options(
                     num_cpus=num_cpus,
                     num_gpus=num_gpus,
                     scheduling_strategy=scheduling_strategy,
-                ).remote(
-                    pretrain,
-                    trust_remote_code=True,
-                    tensor_parallel_size=tensor_parallel_size,
-                    dtype="bfloat16",
-                    seed=seed + i,
-                    enable_prefix_caching=enable_prefix_caching,
-                    enforce_eager=enforce_eager,
-                    max_model_len=max_model_len,
-                    enable_chunked_prefill=enable_chunked_prefill,
-                    max_num_batched_tokens=max_num_batched_tokens if enable_chunked_prefill else None,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_num_seqs=max_num_seqs,
-                    block_size=256,
-                )
+                ).remote(pretrain, **remote_kwargs)
             )
         if colocate_with_actor:
             offload_refs = []

@@ -336,7 +336,7 @@ class CustomRewardTrainer(RayPPOTrainer):
             max_tokens=self.cfg.generate_max_len,
             skip_special_tokens=False,
             include_stop_str_in_output=True,
-            stop=self.cfg.stop,
+            stop=list(self.cfg.stop),
         )
         responses, stop_reasons = await gen_func(
             prompts=prompts, sampling_params=sampling_params, use_tqdm=False, truncate_prompt=True
@@ -396,7 +396,7 @@ class CustomRewardTrainer(RayPPOTrainer):
             temperature=self.cfg.temperature,
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.generate_max_len,
-            stop=self.cfg.stop,
+            stop=list(self.cfg.stop),
             skip_special_tokens=False,
             include_stop_str_in_output=True,
         )

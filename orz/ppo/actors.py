@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import socket
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
 from typing import Dict, Optional, Type, Union
@@ -14,7 +15,7 @@ from ray.util.placement_group import PlacementGroup, PlacementGroupSchedulingStr
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModel
+from transformers import AutoConfig
 
 # from openrlhf.models import Actor
 from transformers.trainer import get_scheduler
@@ -26,6 +27,22 @@ from orz.ppo.utils import ORZDeepspeedStrategy as DeepspeedStrategy
 from orz.ppo.utils import masked_mean
 
 _SET_AFFINITY = False
+
+try:
+    from packaging.version import Version
+except ImportError:  # pragma: no cover
+    Version = None
+
+
+def _version_gte(current: str, target: str) -> bool:
+    if Version is not None:
+        return Version(current) >= Version(target)
+    current_nums = tuple(int(x) for x in re.findall(r"\d+", current))
+    target_nums = tuple(int(x) for x in re.findall(r"\d+", target))
+    max_len = max(len(current_nums), len(target_nums))
+    current_nums = current_nums + (0,) * (max_len - len(current_nums))
+    target_nums = target_nums + (0,) * (max_len - len(target_nums))
+    return current_nums >= target_nums
 
 
 # Adapt from OpenRLHF
@@ -639,7 +656,7 @@ class PolicyRayActorBase(RayActor):
             # https://github.com/OpenRLHF/OpenRLHF/issues/313
             import vllm
 
-            if vllm.__version__ > "0.4.2" and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
+            if _version_gte(vllm.__version__, "0.4.3") and os.getenv("NCCL_P2P_DISABLE", "0") == "0":
                 backend = "gloo"
                 self.strategy.print(
                     "WARNING:using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
@@ -679,7 +696,7 @@ class PolicyRayActorBase(RayActor):
             if torch.distributed.get_rank() == 0:
                 shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
                 refs = [
-                    engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+                    engine.update_weight.remote(name, dtype=str(param.dtype), shape=shape, empty_cache=count == num_params)
                     for engine in vllm_engines
                 ]
             # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
@@ -703,7 +720,7 @@ class PolicyRayActorBase(RayActor):
                 refs = [
                     vllm_engines[rank].update_weight_internal_with_cuda_ipc.remote(
                         name,
-                        dtype=param.dtype,
+                        dtype=str(param.dtype),
                         shape=shape,
                         cudaipc_handler=CUDAIPCHandle.from_tensor(param.data),
                         empty_cache=count == num_params,
@@ -742,8 +759,7 @@ class CriticRayActorBase(RayActor):
         self._setup_distributed(strategy)
 
         ds_config = strategy.get_ds_train_config(is_actor=False)
-        with torch.device("meta"):
-            AutoModel.from_pretrained(pretrain, trust_remote_code=True)
+        AutoConfig.from_pretrained(pretrain, trust_remote_code=True)
         critic = get_llm_for_sequence_regression(
             pretrain,
             "critic",
@@ -910,8 +926,7 @@ class CriticRayActorBase(RayActor):
 class RewardRayActorBase(RayActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
         self._setup_distributed(strategy)
-        with torch.device("meta"):
-            AutoModel.from_pretrained(pretrain, trust_remote_code=True)
+        AutoConfig.from_pretrained(pretrain, trust_remote_code=True)
         model = get_llm_for_sequence_regression(
             pretrain,
             "reward",

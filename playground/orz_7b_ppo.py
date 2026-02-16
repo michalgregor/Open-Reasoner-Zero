@@ -343,7 +343,7 @@ class CustomRewardTrainer(RayPPOTrainer):
             max_tokens=self.cfg.generate_max_len,
             skip_special_tokens=False,
             include_stop_str_in_output=True,
-            stop=self.cfg.stop,
+            stop=list(self.cfg.stop),
         )
         responses, stop_reasons = await gen_func(
             prompts=prompts, sampling_params=sampling_params, use_tqdm=False, truncate_prompt=True
@@ -403,7 +403,7 @@ class CustomRewardTrainer(RayPPOTrainer):
             temperature=self.cfg.temperature,
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.generate_max_len,
-            stop=self.cfg.stop,
+            stop=list(self.cfg.stop),
             skip_special_tokens=False,
             include_stop_str_in_output=True,
         )
@@ -416,10 +416,12 @@ class CustomRewardTrainer(RayPPOTrainer):
 
         output_for_save = []
         log_dict = defaultdict(float)
+        observed_file_names = set()
         for batch in dataloader:
             prompts = list(batch[0])
             answers = list(batch[1]["answer"])
             file_names = list(batch[1]["file_name"])
+            observed_file_names.update(file_names)
             outputs = []
             for i, llm in enumerate(self.vllm_engines):
                 outputs.append(
@@ -459,21 +461,27 @@ class CustomRewardTrainer(RayPPOTrainer):
                 log_dict[f"{file_name}/total"] += 1
 
         # get all file_names from self.cfg.eval_prompt_data
-        all_file_names: List[str] = [
-            os.path.splitext(os.path.basename(file_path))[0] for file_path in self.cfg.eval_prompt_data
-        ]
+        all_file_names: List[str] = [os.path.splitext(os.path.basename(file_path))[0] for file_path in self.cfg.eval_prompt_data]
+        if len(all_file_names) == 0:
+            all_file_names = sorted(observed_file_names)
         for file_name in all_file_names:
-            log_dict[f"{file_name}/response_len_in_char"] = (
-                log_dict[f"{file_name}/total_response_len_in_char"] / log_dict[f"{file_name}/total"]
-            )
-            log_dict[f"{file_name}/accuracy"] = log_dict[f"{file_name}/correct"] / log_dict[f"{file_name}/total"]
+            total = log_dict[f"{file_name}/total"]
+            if total > 0:
+                log_dict[f"{file_name}/response_len_in_char"] = log_dict[f"{file_name}/total_response_len_in_char"] / total
+                log_dict[f"{file_name}/accuracy"] = log_dict[f"{file_name}/correct"] / total
+            else:
+                log_dict[f"{file_name}/response_len_in_char"] = 0.0
+                log_dict[f"{file_name}/accuracy"] = 0.0
             log_dict.pop(f"{file_name}/total_response_len_in_char")
             log_dict.pop(f"{file_name}/correct")
             log_dict.pop(f"{file_name}/total")
         # calculate average accuracy
-        log_dict["eval_accuracy"] = sum([log_dict[f"{file_name}/accuracy"] for file_name in all_file_names]) / len(
-            all_file_names
-        )
+        if len(all_file_names) > 0:
+            log_dict["eval_accuracy"] = sum([log_dict[f"{file_name}/accuracy"] for file_name in all_file_names]) / len(
+                all_file_names
+            )
+        else:
+            log_dict["eval_accuracy"] = 0.0
 
         dump_file_name = f"eval_output_iter{self.global_step}"
         # join all acc from all_file_names

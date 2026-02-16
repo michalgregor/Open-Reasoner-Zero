@@ -181,7 +181,7 @@ class RayPPOTrainer:
                         await self.critic_model.async_save_model(self.tokenizer, self.global_step)
                     logger.info("Successfully save model weights, training continue.")
 
-            if self.cfg.update_ref_every_epoch:
+            if self.cfg.update_ref_every_epoch and self.ref_model is not None:
                 await self.policy_model.backload_to_gpu()
                 await self.policy_model.async_save_model(self.tokenizer, self.global_step)
                 await self.policy_model.offload_to_cpu()
@@ -399,9 +399,11 @@ class RayPPOTrainer:
                 await self.critic_model.offload_to_cpu()
 
         # calculate ref log probs
-        base_action_log_probs_ref = micro_infer_model(
-            num_ref_dp_groups, "ref_model", sequences_all, num_actions_all, attention_mask_all, packed_seq_lens_all
-        )
+        base_action_log_probs_ref = None
+        if self.ref_model is not None:
+            base_action_log_probs_ref = micro_infer_model(
+                num_ref_dp_groups, "ref_model", sequences_all, num_actions_all, attention_mask_all, packed_seq_lens_all
+            )
         base_log_probs = None
 
         # handle colocate critic and reward model
@@ -410,7 +412,7 @@ class RayPPOTrainer:
             await self.critic_model.async_run_method("empty_cache")
 
         # handle colocate actor and ref model
-        if self.cfg.colocate_actor_ref or self.cfg.colocate_all:
+        if (self.cfg.colocate_actor_ref or self.cfg.colocate_all) and base_action_log_probs_ref is not None:
             base_log_probs = await base_action_log_probs_ref
             await self.ref_model.async_run_method("empty_cache")
 
@@ -447,35 +449,52 @@ class RayPPOTrainer:
         if self.cfg.colocate_all:
             action_log_probs = await action_log_probs_ref
             await self.policy_model.offload_to_cpu()
+            if self.ref_model is None:
+                base_log_probs = [x.detach() for x in action_log_probs]
 
         # wait all models done
         # if not colocate_actor_ref, then need to gather base_log_probs
         # if not colocate_critic_reward and self.critic_model is not None, then need to gather value
         # reward_refs is always handled at last
         if not self.cfg.colocate_all:
-            if not self.cfg.colocate_actor_ref:
-                if not self.cfg.colocate_critic_reward and self.critic_model is not None:
-                    results = await asyncio.gather(
-                        value_ref, base_action_log_probs_ref, action_log_probs_ref, *reward_refs
-                    )
-                    values, base_log_probs, action_log_probs, rewards = results[0], results[1], results[2], results[3:]
-                else:
-                    results = await asyncio.gather(base_action_log_probs_ref, action_log_probs_ref, *reward_refs)
-                    base_log_probs, action_log_probs, rewards = results[0], results[1], results[2:]
-            else:
+            if self.ref_model is None:
                 if not self.cfg.colocate_critic_reward and self.critic_model is not None:
                     results = await asyncio.gather(value_ref, action_log_probs_ref, *reward_refs)
                     values, action_log_probs, rewards = results[0], results[1], results[2:]
                 else:
                     results = await asyncio.gather(action_log_probs_ref, *reward_refs)
                     action_log_probs, rewards = results[0], results[1:]
+                base_log_probs = [x.detach() for x in action_log_probs]
+            else:
+                if not self.cfg.colocate_actor_ref:
+                    if not self.cfg.colocate_critic_reward and self.critic_model is not None:
+                        results = await asyncio.gather(
+                            value_ref, base_action_log_probs_ref, action_log_probs_ref, *reward_refs
+                        )
+                        values, base_log_probs, action_log_probs, rewards = (
+                            results[0],
+                            results[1],
+                            results[2],
+                            results[3:],
+                        )
+                    else:
+                        results = await asyncio.gather(base_action_log_probs_ref, action_log_probs_ref, *reward_refs)
+                        base_log_probs, action_log_probs, rewards = results[0], results[1], results[2:]
+                else:
+                    if not self.cfg.colocate_critic_reward and self.critic_model is not None:
+                        results = await asyncio.gather(value_ref, action_log_probs_ref, *reward_refs)
+                        values, action_log_probs, rewards = results[0], results[1], results[2:]
+                    else:
+                        results = await asyncio.gather(action_log_probs_ref, *reward_refs)
+                        action_log_probs, rewards = results[0], results[1:]
 
         r = torch.stack(rewards).sum(dim=0) if len(rewards) > 0 else None
         if not self.cfg.colocate_all:
             empty_cache_tasks = [
                 self.policy_model.async_run_method("empty_cache"),
-                self.ref_model.async_run_method("empty_cache"),
             ]
+            if self.ref_model is not None:
+                empty_cache_tasks.append(self.ref_model.async_run_method("empty_cache"))
             if self.critic_model:
                 empty_cache_tasks.append(self.critic_model.async_run_method("empty_cache"))
             if self.reward_model:
@@ -573,14 +592,18 @@ class RayPPOTrainer:
         pg = None
 
         if cfg.colocate_all:
+            use_reference_model = getattr(cfg, "use_reference_model", True)
             assert (
                 cfg.actor_num_nodes == cfg.critic_num_nodes
                 and cfg.actor_num_gpus_per_node == cfg.critic_num_gpus_per_node
-                and cfg.actor_num_nodes == cfg.ref_num_nodes
-                and cfg.actor_num_gpus_per_node == cfg.ref_num_gpus_per_node
                 and cfg.actor_num_gpus_per_node == 1
                 and cfg.actor_num_nodes == cfg.vllm_num_engines
             ), "num_nodes and num_gpus_per_node must be the same when colocate all models and each actor has only one gpu."
+            if use_reference_model:
+                assert (
+                    cfg.actor_num_nodes == cfg.ref_num_nodes
+                    and cfg.actor_num_gpus_per_node == cfg.ref_num_gpus_per_node
+                ), "num_nodes and num_gpus_per_node must be the same when colocate actor and ref model."
             pg = self.colocate_pg
 
             policy_model = PPORayActorGroup(
@@ -590,13 +613,16 @@ class RayPPOTrainer:
                 pg=pg,
                 num_gpus_per_actor=0.2,
             )
-            ref_model = PPORayActorGroup(
-                cfg.ref_num_nodes,
-                cfg.ref_num_gpus_per_node,
-                RefRayActor,
-                pg=pg,
-                num_gpus_per_actor=0.2,
-            )
+            if use_reference_model:
+                ref_model = PPORayActorGroup(
+                    cfg.ref_num_nodes,
+                    cfg.ref_num_gpus_per_node,
+                    RefRayActor,
+                    pg=pg,
+                    num_gpus_per_actor=0.2,
+                )
+            else:
+                ref_model = None
             if cfg.critic_pretrain:
                 critic_model = PPORayActorGroup(
                     cfg.critic_num_nodes,
@@ -626,7 +652,8 @@ class RayPPOTrainer:
                 reward_models = None
 
         else:
-            if cfg.colocate_actor_ref:
+            use_reference_model = getattr(cfg, "use_reference_model", True)
+            if cfg.colocate_actor_ref and use_reference_model:
                 assert (
                     cfg.actor_num_nodes == cfg.ref_num_nodes
                     and cfg.actor_num_gpus_per_node == cfg.ref_num_gpus_per_node
@@ -646,13 +673,16 @@ class RayPPOTrainer:
                 pg=pg,
                 num_gpus_per_actor=0.75 if pg else 1,
             )
-            ref_model = PPORayActorGroup(
-                cfg.ref_num_nodes,
-                cfg.ref_num_gpus_per_node,
-                RefRayActor,
-                pg=pg,
-                num_gpus_per_actor=0.25 if pg else 1,
-            )
+            if use_reference_model:
+                ref_model = PPORayActorGroup(
+                    cfg.ref_num_nodes,
+                    cfg.ref_num_gpus_per_node,
+                    RefRayActor,
+                    pg=pg,
+                    num_gpus_per_actor=0.25 if pg else 1,
+                )
+            else:
+                ref_model = None
 
             # if colocated, create placement group for critic and reward model explicitly.
             pg = None
@@ -699,7 +729,8 @@ class RayPPOTrainer:
 
         if not cfg.colocate_all:
             refs = []
-            refs.extend(ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
+            if ref_model is not None:
+                refs.extend(ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             refs.extend(policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             if cfg.critic_pretrain:
                 refs.extend(critic_model.async_init_model_from_pretrained(self.strategy, cfg.critic_pretrain))
@@ -709,7 +740,8 @@ class RayPPOTrainer:
             await asyncio.gather(*refs)
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
         else:
-            await asyncio.gather(*ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
+            if ref_model is not None:
+                await asyncio.gather(*ref_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await asyncio.gather(*policy_model.async_init_model_from_pretrained(self.strategy, cfg.pretrain))
             await policy_model.async_run_method("_set_pad_token_id", self.tokenizer.pad_token_id)
             await policy_model.offload_to_cpu()
@@ -737,7 +769,8 @@ class RayPPOTrainer:
             await self.policy_model.async_run_method("empty_cache")
         if self.cfg.colocate_all:
             async with Timer("Backload vllm engines to gpu"):
-                await self._backload_vllm_engines()
+                # For weight sync, we only need model weights; defer KV cache wake-up.
+                await self._backload_vllm_engines(tags=["weights"])
         async with Timer("Broadcast actor weights to vllm engines"):
             await self._sync_policy_weights_to_vllm()
 
@@ -1282,14 +1315,26 @@ class RayPPOTrainer:
             offload_tasks.append(engine.offload_to_cpu.remote())
         await asyncio.gather(*offload_tasks)
 
-    async def _backload_vllm_engines(self):
+    async def _backload_vllm_engines(self, tags=None):
         backload_tasks = []
         for engine in self.vllm_engines:
-            backload_tasks.append(engine.backload_to_gpu.remote())
+            backload_tasks.append(engine.backload_to_gpu.remote(tags=tags))
         await asyncio.gather(*backload_tasks)
 
     async def _sync_policy_weights_to_vllm(self):
-        if self.cfg.colocate_all:
+        use_cudaipc = self.cfg.colocate_all
+        if use_cudaipc:
+            try:
+                import vllm
+
+                version_text = getattr(vllm, "__version__", "0")
+                major = int(version_text.split(".", 1)[0])
+                if major >= 1 or version_text.startswith("0.15."):
+                    use_cudaipc = False
+            except Exception:
+                pass
+
+        if use_cudaipc:
             await self.policy_model.async_run_method("_broadcast_to_vllm_cudaipc", self.vllm_engines)
         else:
             await self.policy_model.async_run_method("_broadcast_to_vllm", self.vllm_engines)

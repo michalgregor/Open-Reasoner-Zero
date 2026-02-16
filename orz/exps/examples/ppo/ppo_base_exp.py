@@ -65,6 +65,7 @@ class BasePPOExpConfig(BaseConfig):
     max_num_batched_tokens: int = 2048
     enforce_eager: bool = False
     gpu_memory_utilization: float = 0.85
+    attention_backend: Optional[str] = None
 
     # logging related settings
     eval_steps: int = -1
@@ -108,6 +109,7 @@ class BasePPOExpConfig(BaseConfig):
     use_abs_kl: bool = False
     use_kl_loss: bool = False
     kl_loss_coef: float = 0.0
+    use_reference_model: bool = True
     adam_betas: tuple = (0.9, 0.95)
     reward_clip_range: tuple = (-10, 10)
 
@@ -205,6 +207,7 @@ class BasePPOExp(BaseExp):
             self.cfg.gpu_memory_utilization,
             self.cfg.micro_rollout_batch_size,
             self.get_colocate_pg,
+            self.cfg.attention_backend,
         )
 
     async def run(self):
